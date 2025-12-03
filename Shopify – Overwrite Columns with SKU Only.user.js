@@ -5,8 +5,8 @@
 // @description
 // @author       Erin Bond
 // @match        https://admin.shopify.com/*
-// @updateURL    https://raw.githubusercontent.com/username/repo/main/script.user.js
-// @downloadURL  https://raw.githubusercontent.com/username/repo/main/script.user.js
+// @updateURL    https://github.com/erinb-007/Tampermonkey/raw/refs/heads/main/Shopify%20%E2%80%93%20Overwrite%20Columns%20with%20SKU%20Only.user.js
+// @downloadURL  https://github.com/erinb-007/Tampermonkey/raw/refs/heads/main/Shopify%20%E2%80%93%20Overwrite%20Columns%20with%20SKU%20Only.user.js
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
@@ -80,3 +80,4 @@
   inject();
 
 })();
+
