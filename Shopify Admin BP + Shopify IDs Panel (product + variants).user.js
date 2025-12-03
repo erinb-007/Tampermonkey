@@ -5,6 +5,8 @@
 // @description  Show BP + Shopify product/variant IDs and stock data from Metabase in Shopify admin (product + variant pages), keyed by store + product/variant ID
 // @author       Erin Bond
 // @match        https://admin.shopify.com/store/*/products*
+// @updateURL    https://github.com/erinb-007/Tampermonkey/raw/refs/heads/main/Shopify%20Admin%20BP%20+%20Shopify%20IDs%20Panel%20(product%20+%20variants).user.js
+// @downloadURL  https://github.com/erinb-007/Tampermonkey/raw/refs/heads/main/Shopify%20Admin%20BP%20+%20Shopify%20IDs%20Panel%20(product%20+%20variants).user.js
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      meta.trakracerusa.com
@@ -550,3 +552,4 @@
     }, 800);
 
 })();
+
