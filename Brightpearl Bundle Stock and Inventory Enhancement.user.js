@@ -5,6 +5,8 @@
 // @description  Show extra enchancments in BP
 // @author       Erin Bond
 // @match        https://euw1.brightpearlapp.com/*
+// @updateURL    https://github.com/erinb-007/Tampermonkey/raw/refs/heads/main/Brightpearl%20Bundle%20Stock%20and%20Inventory%20Enhancement.user.js
+// @downloadURL  https://github.com/erinb-007/Tampermonkey/raw/refs/heads/main/Brightpearl%20Bundle%20Stock%20and%20Inventory%20Enhancement.user.js
 // @grant        GM_xmlhttpRequest
 // @connect      52.31.172.165
 // ==/UserScript==
@@ -353,3 +355,4 @@
         }, 1000);
     });
 })();
+
