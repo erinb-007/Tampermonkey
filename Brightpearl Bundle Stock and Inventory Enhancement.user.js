@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Brightpearl Bundle Stock and Inventory Enhancement + TR PO Tab
 // @namespace    http://tampermonkey.net/
-// @version      11.8
-// @description  Bundle & inventory enhancements + TR Purchase Orders tab loaded from Metabase POs only when opened, using new PO question and correct columns/status filters, and hiding PO tab when other tabs are selected.
+// @version      11.13
+// @description  Bundle & inventory enhancements + TR Purchase Orders tab loaded from Metabase POs only when opened, showing coloured status chips and hiding PO tab when other tabs are selected.
 // @author       Erin Bond
 // @match        https://euw1.brightpearlapp.com/*
 // @updateURL    https://github.com/erinb-007/Tampermonkey/raw/refs/heads/main/Brightpearl%20Bundle%20Stock%20and%20Inventory%20Enhancement.user.js
@@ -16,27 +16,42 @@
 
     const METABASE_URL = 'http://52.31.172.165:3000';
 
-    // INVENTORY / BUNDLE CARD (unchanged)
+    // INVENTORY / BUNDLE CARD
     const INVENTORY_CARD_UUID = '2627b450-000b-4e2e-96fa-cc07aee37f8c';
 
-    // NEW PO QUESTION (BP tampermonkey with PO - Duplicate)
-    // Columns: Orderid, Statusid, Warehouseid, Delivery Date,
-    //          Rows Productid, Rows Sku, Rows Quantity, Last Sync Time.
-    const PO_QUESTION_UUID   = '5ecda805-c1d8-40dd-8d6a-da39b4a7cd1d';
+    // NEW PO QUESTION – “Tampermonkeyly PO Final”
+    const PO_QUESTION_UUID   = 'fcd1f170-b73a-4537-8f8b-105e126c938b';
 
     const PO_ORDER_URL_TEMPLATE = 'https://euw1.brightpearlapp.com/patt-op.php?scode=invoice&oID={{ORDERID}}';
 
     // Allowed PO statuses
-    const ALLOWED_PO_STATUS_IDS = new Set(['6', '7', '34', '43', '45']);
+    const ALLOWED_PO_STATUS_IDS = new Set(['6', '7', '34', '43', '46', '45']);
+
+    // Status labels by Brightpearl ID
     const STATUS_NAME_BY_ID = {
         '6':  'Pending PO',
         '7':  'Placed with supplier',
         '34': 'In transit',
+        '36': 'Cancelled PO',
+        '38': 'Delivered',
         '43': 'Submitted for Payment',
+        '46': 'Ready for Submission',
         '45': 'Fully paid'
     };
 
-    // Warehouseid → name mapping from latest warehouse export. [file:134]
+    // Colours taken from your Purchase statuses screen
+    const STATUS_COLOR_BY_ID = {
+        '6':  '#EEEEEE', // Pending PO
+        '7':  '#AAFFEE', // Placed with supplier
+        '34': '#FAFD21', // In transit
+        '36': '#E6515A', // Cancelled PO
+        '38': '#F3A930', // Delivered
+        '43': '#C8DAEE', // Submitted for Payment
+        '46': '#9159F8', // Submitted for Payment
+        '45': '#EA85D3'  // Fully paid
+    };
+
+    // Warehouseid → name mapping
     const WAREHOUSE_ID_MAP = {
         '2':  'Trak Racer US TX ShipBob',
         '3':  'Trak Racer UK AMWorld',
@@ -72,7 +87,8 @@
     let inventoryDataLoaded = false;
 
     // PO DATA (lazy)
-    let poRowsByProduct = {}; // productId -> rows
+    let poRowsByProductId = {};  // productId -> rows
+    let poRowsBySku       = {};  // sku       -> rows (still filled, but not used now)
     let poDataLoaded = false;
     let poDataLoading = false;
     let poDataError = null;
@@ -260,6 +276,14 @@
             text-decoration: underline;
             color: #1a3a6b;
         }
+        .bp-po-status-chip {
+            display: inline-block;
+            margin-left: 4px;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            border: 1px solid #999;
+        }
         #bp-po-empty {
             font-size: 11px;
             color: #777;
@@ -277,6 +301,13 @@
     function getCurrentProductId() {
         const match = window.location.href.match(/pID=(\d+)/);
         return match ? match[1] : null;
+    }
+
+    function getCurrentSkuFromHeader() {
+        const span = document.getElementById('bp-sku-display');
+        if (!span) return null;
+        const m = span.textContent.match(/SKU:\s*(.+)$/i);
+        return m ? m[1].trim() : null;
     }
 
     function addSkuToTitle() {
@@ -532,7 +563,7 @@
         }
     }
 
-    // ---------- INVENTORY TAB ----------
+    // ---------- STOCK / INVENTORY TAB ----------
     function updateStockInventoryTab() {
         if (!inventoryDataLoaded) return;
 
@@ -652,28 +683,41 @@
                         poDataError = 'Unexpected JSON format from Metabase PO question.';
                     } else {
                         rows.forEach(row => {
-                            // Product ID comes from Rows Productid in this question
-                            const productIdRaw = row['Rows Productid'] ?? row['Product ID'];
-                            const productId = productIdRaw != null ? String(productIdRaw).trim() : '';
-                            if (!productId) return;
+                            // Exact keys from Metabase JSON
+                            const productIdRaw = row['Bp Order Item - Orderid \u2192 Productid'];
+                            const skuRaw       = row['Bp Order Item - Orderid \u2192 Productsku'];
+                            const qtyRaw       = row['Bp Order Item - Orderid \u2192 Quantity'];
+                            const statusRaw    = row['Statusid'];
+                            const whRaw        = row['Warehouseid'];
+                            const orderIdRaw   = row['Orderid'];
+                            const deliveryRaw  = row['Delivery Date'];
 
-                            const statusRaw = row['Statusid'] ?? row['Bp Po - Product → Statusid'];
+                            const productId = productIdRaw != null
+                                ? String(productIdRaw).replace(/,/g, '').trim()
+                                : '';
+                            const sku      = skuRaw != null ? String(skuRaw).trim() : '';
                             const statusId = statusRaw != null ? String(statusRaw) : null;
+
                             if (!statusId || !ALLOWED_PO_STATUS_IDS.has(statusId)) return;
 
-                            if (!poRowsByProduct[productId]) {
-                                poRowsByProduct[productId] = [];
+                            const baseObj = {
+                                orderId:  orderIdRaw != null ? String(orderIdRaw) : '',
+                                warehouseId: whRaw != null ? String(whRaw) : '',
+                                delivery: deliveryRaw,
+                                sku: sku,
+                                qty: qtyRaw != null ? Number(qtyRaw) : 0,
+                                statusId: statusId
+                            };
+
+                            if (productId) {
+                                if (!poRowsByProductId[productId]) poRowsByProductId[productId] = [];
+                                poRowsByProductId[productId].push(baseObj);
                             }
 
-                            poRowsByProduct[productId].push({
-                                orderId: row['Orderid'] ?? row['Bp Po - Product → Orderid'],
-                                warehouseId: row['Warehouseid'] ?? row['Bp Po - Product → Warehouseid'],
-                                delivery: row['Delivery Date'] ?? row['Bp Po - Product → Delivery Date'],
-                                sku: row['Rows Sku'] ?? row['Bp Po - Product → Rows Sku'],
-                                qty: row['Rows Quantity'] ?? row['Bp Po - Product → Rows Quantity'],
-                                lastSync: row['Last Sync Time'] ?? row['Bp Po - Product → Last Sync Time'],
-                                statusId: statusId
-                            });
+                            if (sku) {
+                                if (!poRowsBySku[sku]) poRowsBySku[sku] = [];
+                                poRowsBySku[sku].push(baseObj);
+                            }
                         });
                     }
                 } catch (err) {
@@ -742,7 +786,6 @@
             poTabPanel = div;
         }
 
-        // Direct click handler for TR PO nav
         poTabLink.addEventListener('click', function(e) {
             e.preventDefault();
             openPoTab();
@@ -753,12 +796,10 @@
         ensurePoTabExists();
         if (!poTabPanel || !poTabLink) return;
 
-        // Hide all tab panels, then show ours
         const allTabs = document.querySelectorAll('.tabbertab');
         allTabs.forEach(t => t.classList.add('tabbertabhide'));
         poTabPanel.classList.remove('tabbertabhide');
 
-        // Update active tab class in nav
         const navList = poTabLink.closest('ul');
         if (navList) {
             navList.querySelectorAll('li').forEach(li => li.classList.remove('tabberactive'));
@@ -767,19 +808,21 @@
         }
 
         const productId = getCurrentProductId();
-        if (!productId) {
-            poTabPanel.innerHTML = '<div id="bp-po-tab-inner"><h3>TR Purchase Orders</h3><div>No Product ID detected on this page.</div></div>';
+        const sku       = getCurrentSkuFromHeader();
+
+        if (!productId && !sku) {
+            poTabPanel.innerHTML = '<div id="bp-po-tab-inner"><h3>TR Purchase Orders</h3><div>No Product ID or SKU detected on this page.</div></div>';
             return;
         }
 
         poTabPanel.innerHTML = '<div id="bp-po-tab-inner"><h3>TR Purchase Orders</h3><div class="bp-po-notice">Loading purchase orders from Metabase…</div></div>';
 
         fetchPoDataIfNeeded(() => {
-            renderPoTab(productId);
+            renderPoTab(productId, sku);
         });
     }
 
-    function renderPoTab(productId) {
+    function renderPoTab(productId, sku) {
         ensurePoTabExists();
         if (!poTabPanel) return;
 
@@ -801,7 +844,11 @@
             return;
         }
 
-        const rows = poRowsByProduct[productId] || [];
+        // use ONLY productId to avoid duplicates
+        let rows = [];
+        if (productId && poRowsByProductId[productId]) {
+            rows = poRowsByProductId[productId];
+        }
 
         if (!rows.length) {
             html += '<div id="bp-po-empty">No matching purchase orders found for this SKU in the allowed statuses.</div>';
@@ -831,6 +878,12 @@
             return PO_ORDER_URL_TEMPLATE.replace('{{ORDERID}}', encodeURIComponent(orderId));
         };
 
+        const buildStatusChip = (statusId) => {
+            const label = STATUS_NAME_BY_ID[statusId] || statusId;
+            const color = STATUS_COLOR_BY_ID[statusId] || '#EEEEEE';
+            return `<span class="bp-po-status-chip" style="background:${color};">${label}</span>`;
+        };
+
         html += '<table id="bp-po-table">';
         html += '<thead><tr><th>Warehouse</th><th>Open Purchase Orders</th></tr></thead><tbody>';
 
@@ -855,7 +908,9 @@
                     ? `<a href="${url}" target="_blank" title="Open ${idLabel}">${idLabel}</a>`
                     : `<span>${idLabel}</span>`;
 
-                lines += `<div class="bp-po-line">${linkHtml} — ${qty} due ${delivery}</div>`;
+                const statusChip = buildStatusChip(o.statusId);
+
+                lines += `<div class="bp-po-line">${linkHtml} — ${qty} due ${delivery} ${statusChip}</div>`;
             });
 
             html += `<tr><td>${warehouse}</td><td>${lines}</td></tr>`;
@@ -869,41 +924,34 @@
     }
 
     // ---------- events & init ----------
-document.body.addEventListener('click', function(e) {
-    // Existing behaviour for bundle & stock tabs
-    if (e.target.id === 'undefinednav8' || e.target.closest('#undefinednav8')) {
-        setTimeout(updateBundleTable, 300);
-    }
-    if (e.target.id === 'undefinednav2' || e.target.closest('#undefinednav2')) {
-        setTimeout(updateStockInventoryTab, 300);
-    }
-
-    // When any other tab in the same nav as TR PO is clicked,
-    // hide the TR PO panel and remove any PO notices so their
-    // text cannot appear on other tabs.
-    const a = e.target.closest('a');
-    if (a && poTabPanel && poTabLink) {
-        const navList = poTabLink.closest('ul');
-        if (navList && navList.contains(a) && a.id !== 'trakpo-nav') {
-            // Hide our custom tab
-            poTabPanel.classList.add('tabbertabhide');
-            const li = poTabLink.closest('li');
-            if (li) li.classList.remove('tabberactive');
-
-            // Remove any PO notice elements that might have been moved
-            document.querySelectorAll('.bp-po-notice').forEach(el => el.remove());
+    document.body.addEventListener('click', function(e) {
+        if (e.target.id === 'undefinednav8' || e.target.closest('#undefinednav8')) {
+            setTimeout(updateBundleTable, 300);
         }
-    }
+        if (e.target.id === 'undefinednav2' || e.target.closest('#undefinednav2')) {
+            setTimeout(updateStockInventoryTab, 300);
+        }
 
-    setTimeout(addSkuToTitle, 500);
-});
+        const a = e.target.closest('a');
+        if (a && poTabPanel && poTabLink) {
+            const navList = poTabLink.closest('ul');
+            if (navList && navList.contains(a) && a.id !== 'trakpo-nav') {
+                poTabPanel.classList.add('tabbertabhide');
+                const li = poTabLink.closest('li');
+                if (li) li.classList.remove('tabberactive');
+                document.querySelectorAll('.bp-po-notice').forEach(el => el.remove());
+            }
+        }
 
-fetchInventoryData().then(() => {
-    setTimeout(() => {
-        addSkuToTitle();
-        updateBundleTable();
-        updateStockInventoryTab();
-        ensurePoTabExists();
-    }, 1000);
-});
+        setTimeout(addSkuToTitle, 500);
+    });
+
+    fetchInventoryData().then(() => {
+        setTimeout(() => {
+            addSkuToTitle();
+            updateBundleTable();
+            updateStockInventoryTab();
+            ensurePoTabExists();
+        }, 1000);
+    });
 })();
