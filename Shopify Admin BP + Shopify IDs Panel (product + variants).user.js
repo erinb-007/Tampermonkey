@@ -45,8 +45,8 @@
     const COL_COMPOSITION     = 'Product Composition';
 
     const COL_STORE           = 'All shopify Variants (all stores) Union ALL - Sku → store';
-    const COL_SHOPIFY_PID     = 'All shopify Variants (all stores) Union ALL - Sku → shopify_product_id';
-    const COL_SHOPIFY_VID     = 'All shopify Variants (all stores) Union ALL - Sku → shopify_variant_id';
+    const COL_SHOPIFY_PID     = 'All shopify Variants (all stores) Union ALL - Sku → product_id';
+    const COL_SHOPIFY_VID     = 'All shopify Variants (all stores) Union ALL - Sku → variantsid';
     const COL_SHOPIFY_SKU     = 'All shopify Variants (all stores) Union ALL - Sku → sku';
 
     const COL_STOCK_EU        = 'BP Stock MASTER & Bundles - Product → Trak Racer EU Warehouse - On hand';
@@ -552,4 +552,5 @@
     }, 800);
 
 })();
+
 
