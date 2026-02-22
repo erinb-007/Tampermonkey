@@ -16,7 +16,7 @@
 
     const METABASE_URL = 'http://52.31.172.165:3000';
 
-    // INVENTORY / BUNDLE CARD
+    // INVENTORY / BUNDLE CARD name:BP Tampermonkey Script Source (inventory dimensions etc)
     const INVENTORY_CARD_UUID = '2627b450-000b-4e2e-96fa-cc07aee37f8c';
 
     // NEW PO QUESTION – “Tampermonkeyly PO Final”
@@ -955,3 +955,4 @@
         }, 1000);
     });
 })();
+
