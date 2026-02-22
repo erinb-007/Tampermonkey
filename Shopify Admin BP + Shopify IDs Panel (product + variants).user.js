@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shopify Admin BP + Shopify IDs Panel (product + variants)
 // @namespace    https://trakracer.com/
-// @version      3.3
+// @version      3.4
 // @description  Show BP + Shopify product/variant IDs and stock data from Metabase in Shopify admin (product + variant pages), keyed by store + product/variant ID
 // @author       Erin Bond
 // @match        https://admin.shopify.com/store/*/products*
@@ -552,5 +552,6 @@
     }, 800);
 
 })();
+
 
 
