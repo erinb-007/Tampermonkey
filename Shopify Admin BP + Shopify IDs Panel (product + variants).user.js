@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Shopify Admin BP + Shopify IDs Panel (product + variants)
 // @namespace    https://trakracer.com/
-// @version      4.0
-// @description  Show BP + Shopify product/variant IDs and stock data from Metabase in Shopify admin (product + variant pages), keyed by store + product/variant ID
+// @version      4.1
+// @description  Show BP + Shopify product/variant IDs and stock data from Metabase in Shopify admin (product + variant pages)
 // @author       Erin Bond
 // @match        https://admin.shopify.com/store/*
 // @updateURL    https://github.com/erinb-007/Tampermonkey/raw/refs/heads/main/Shopify%20Admin%20BP%20+%20Shopify%20IDs%20Panel%20(product%20+%20variants).user.js
@@ -102,41 +102,6 @@
     }
 
     /********************************************************************
-     * WAIT FOR DOM TO SETTLE
-     * Watches for mutations and resolves once nothing has changed for
-     * quietMs milliseconds — meaning Shopify has finished re-rendering
-     ********************************************************************/
-
-    function waitForDomSettle(quietMs = 500, timeout = 15000) {
-        return new Promise((resolve, reject) => {
-            let timer = null;
-
-            const done = () => {
-                obs.disconnect();
-                resolve();
-            };
-
-            const reset = () => {
-                if (timer) clearTimeout(timer);
-                timer = setTimeout(done, quietMs);
-            };
-
-            const obs = new MutationObserver(reset);
-            obs.observe(document.body, { childList: true, subtree: true });
-
-            // Start the timer immediately in case DOM is already settled
-            reset();
-
-            // Hard timeout fallback
-            setTimeout(() => {
-                if (timer) clearTimeout(timer);
-                obs.disconnect();
-                resolve(); // resolve anyway, don't reject
-            }, timeout);
-        });
-    }
-
-    /********************************************************************
      * SHOPIFY HELPERS
      ********************************************************************/
 
@@ -145,12 +110,12 @@
         if (!match) return null;
         const slug = match[1].toLowerCase();
         const cfg = { storeCode: null, stockLabel: null };
-        if (slug.includes('aus') || slug.includes('au'))        { cfg.storeCode = 'AU'; cfg.stockLabel = 'AU WFDS';    return cfg; }
-        if (slug.includes('eu'))                                 { cfg.storeCode = 'EU'; cfg.stockLabel = 'EU WH';      return cfg; }
-        if (slug.includes('canada') || slug.includes('ca'))     { cfg.storeCode = 'CA'; cfg.stockLabel = 'CA GO BOLT'; return cfg; }
-        if (slug.includes('trakraceres') || slug.includes('es')){ cfg.storeCode = 'SP'; cfg.stockLabel = 'ES WH';      return cfg; }
+        if (slug.includes('aus') || slug.includes('au'))         { cfg.storeCode = 'AU'; cfg.stockLabel = 'AU WFDS';    return cfg; }
+        if (slug.includes('eu'))                                  { cfg.storeCode = 'EU'; cfg.stockLabel = 'EU WH';      return cfg; }
+        if (slug.includes('canada') || slug.includes('ca'))      { cfg.storeCode = 'CA'; cfg.stockLabel = 'CA GO BOLT'; return cfg; }
+        if (slug.includes('trakraceres') || slug.includes('es')) { cfg.storeCode = 'SP'; cfg.stockLabel = 'ES WH';      return cfg; }
         if (slug.includes('trakracer-uk') || slug.includes('uk')){ cfg.storeCode = 'UK'; cfg.stockLabel = 'UK AMWorld'; return cfg; }
-        if (slug === 'trakracer' || slug.includes('us'))        { cfg.storeCode = 'US'; cfg.stockLabel = 'ARC Sentry'; return cfg; }
+        if (slug === 'trakracer' || slug.includes('us'))         { cfg.storeCode = 'US'; cfg.stockLabel = 'ARC Sentry'; return cfg; }
         return null;
     }
 
@@ -267,14 +232,22 @@
      ********************************************************************/
 
     function findSidebarCard() {
+        // Target the right column directly by its Polaris layout class
+        const rightCol = document.querySelector('.Polaris-Layout__Section--oneThird');
+        if (rightCol) {
+            const firstCard = rightCol.querySelector('.Polaris-LegacyCard');
+            if (firstCard) return firstCard;
+            return rightCol;
+        }
+        // Fallback
         for (const text of ['Publishing', 'Status']) {
             const h = Array.from(document.querySelectorAll('h2, h3')).find(el => el.textContent.trim() === text);
             if (h) {
-                const card = h.closest('div[class*="Card"], section');
+                const card = h.closest('.Polaris-LegacyCard, div[class*="Card"], section');
                 if (card?.parentElement) return card;
             }
         }
-        return document.querySelector('[class*="Sidebar"]');
+        return null;
     }
 
     function findVariantRightColumn() {
@@ -303,6 +276,35 @@
             return rightDivs[0];
         }
         return null;
+    }
+
+    /********************************************************************
+     * WAIT HELPERS
+     ********************************************************************/
+
+    function waitForElement(selectorFn, timeout = 15000) {
+        return new Promise((resolve, reject) => {
+            const found = selectorFn();
+            if (found) return resolve(found);
+            const obs = new MutationObserver(() => {
+                const el = selectorFn();
+                if (el) { obs.disconnect(); resolve(el); }
+            });
+            obs.observe(document.body, { childList: true, subtree: true });
+            setTimeout(() => { obs.disconnect(); reject(new Error('Timed out')); }, timeout);
+        });
+    }
+
+    function waitForDomSettle(quietMs = 500, timeout = 15000) {
+        return new Promise(resolve => {
+            let timer = null;
+            const done = () => { obs.disconnect(); resolve(); };
+            const reset = () => { if (timer) clearTimeout(timer); timer = setTimeout(done, quietMs); };
+            const obs = new MutationObserver(reset);
+            obs.observe(document.body, { childList: true, subtree: true });
+            reset();
+            setTimeout(() => { if (timer) clearTimeout(timer); obs.disconnect(); resolve(); }, timeout);
+        });
     }
 
     /********************************************************************
@@ -480,22 +482,15 @@
 
             const startUrl = location.href;
 
-            // Kick off the Metabase fetch immediately in the background
-            // so data is ready by the time we finish waiting for the DOM
             const dataPromise = fetchMetabaseRows(cfg.storeCode, productId);
 
-            // Wait for the DOM to fully settle (stop mutating for 600ms)
-            // This handles Shopify's multiple re-render passes on SPA navigation
-            // Wait for anchor to appear first, then just a short settle
             log('Waiting for anchor…');
             await waitForElement(isVariant ? findVariantRightColumn : findSidebarCard);
             log('Anchor found, settling…');
             await waitForDomSettle(300, 3000);
-            log('DOM settled');
 
             if (location.href !== startUrl) { log('URL changed, bailing'); return; }
 
-            // Make sure our anchor element exists after settle
             const anchorFn = isVariant ? findVariantRightColumn : findSidebarCard;
             if (!anchorFn()) {
                 log('Anchor not found after DOM settle');
@@ -507,12 +502,10 @@
 
             setPanelStatus('Loading…');
 
-            // Wait for data (may already be done since we started it early)
             const { rows, bpIdToSku } = await dataPromise;
 
             if (location.href !== startUrl) { log('URL changed during fetch, bailing'); return; }
 
-            // Re-inject if Shopify removed the panel while we awaited data
             if (!document.getElementById('bp-shopify-panel')) {
                 log('Panel removed during fetch, re-injecting');
                 const repanel = injectPanel(isVariant);
