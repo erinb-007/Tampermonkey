@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Brightpearl Bundle Stock and Inventory Enhancement + TR PO Tab
 // @namespace    http://tampermonkey.net/
-// @version      11.13
+// @version      11.15
 // @description  Bundle & inventory enhancements + TR Purchase Orders tab loaded from Metabase POs only when opened, showing coloured status chips and hiding PO tab when other tabs are selected.
 // @author       Erin Bond
 // @match        https://euw1.brightpearlapp.com/*
@@ -16,18 +16,23 @@
 
     const METABASE_URL = 'http://52.31.172.165:3000';
 
-    // INVENTORY / BUNDLE CARD name:BP Tampermonkey Script Source (inventory dimensions etc)
+    // INVENTORY / BUNDLE CARD
     const INVENTORY_CARD_UUID = '2627b450-000b-4e2e-96fa-cc07aee37f8c';
 
-    // NEW PO QUESTION – “Tampermonkeyly PO Final”
-    const PO_QUESTION_UUID   = 'fcd1f170-b73a-4537-8f8b-105e126c938b';
+    // PO QUESTION – "Tampermonkeyly PO Final"
+    const PO_QUESTION_UUID = 'fcd1f170-b73a-4537-8f8b-105e126c938b';
+
+    // ─── METABASE FILTERING ────────────────────────────────────────────────────
+    // Matches the {{product_id}} template-tag variable name in the Metabase SQL.
+    // Set to null to fall back to fetching the full dataset (slow, old behaviour).
+    const PO_PRODUCT_ID_TEMPLATE_TAG = 'product_id';
+    // ──────────────────────────────────────────────────────────────────────────
 
     const PO_ORDER_URL_TEMPLATE = 'https://euw1.brightpearlapp.com/patt-op.php?scode=invoice&oID={{ORDERID}}';
 
-    // Allowed PO statuses
+    // Allowed PO statuses — must stay in sync with the SQL IN() list
     const ALLOWED_PO_STATUS_IDS = new Set(['6', '7', '34', '43', '46', '45']);
 
-    // Status labels by Brightpearl ID
     const STATUS_NAME_BY_ID = {
         '6':  'Pending PO',
         '7':  'Placed with supplier',
@@ -39,19 +44,17 @@
         '45': 'Fully paid'
     };
 
-    // Colours taken from your Purchase statuses screen
     const STATUS_COLOR_BY_ID = {
-        '6':  '#EEEEEE', // Pending PO
-        '7':  '#AAFFEE', // Placed with supplier
-        '34': '#FAFD21', // In transit
-        '36': '#E6515A', // Cancelled PO
-        '38': '#F3A930', // Delivered
-        '43': '#C8DAEE', // Submitted for Payment
-        '46': '#9159F8', // Submitted for Payment
-        '45': '#EA85D3'  // Fully paid
+        '6':  '#EEEEEE',
+        '7':  '#AAFFEE',
+        '34': '#FAFD21',
+        '36': '#E6515A',
+        '38': '#F3A930',
+        '43': '#C8DAEE',
+        '46': '#9159F8',
+        '45': '#EA85D3'
     };
 
-    // Warehouseid → name mapping
     const WAREHOUSE_ID_MAP = {
         '2':  'Trak Racer US TX ShipBob',
         '3':  'Trak Racer UK AMWorld',
@@ -86,13 +89,17 @@
     let productDataCache = {};
     let inventoryDataLoaded = false;
 
-    // PO DATA (lazy)
-    let poRowsByProductId = {};  // productId -> rows
-    let poRowsBySku       = {};  // sku       -> rows (still filled, but not used now)
-    let poDataLoaded = false;
-    let poDataLoading = false;
-    let poDataError = null;
+    // PO DATA
+    let poRowsByProductId     = {};       // productId → rows[]
+    let poFullDataLoaded      = false;    // true once full-dataset fetch is complete
+    let poFullDataLoading     = false;
+    let poLoadedProductIds    = new Set();
+    let poLoadingProductIds   = new Set();
+    let poDataError           = null;
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // STYLES
+    // ─────────────────────────────────────────────────────────────────────────
     const style = document.createElement('style');
     style.textContent = `
         .tabbertab table tr td[data-bp-stock],
@@ -141,7 +148,6 @@
             vertical-align: middle;
         }
         #bp-sku-display strong { font-weight: 600; }
-
         #bp-warehouse-breakdown {
             margin: 20px 0 10px 0;
             padding: 15px;
@@ -195,7 +201,6 @@
             padding: 8px;
         }
         #bp-warehouse-table tfoot td:last-child { text-align: center; }
-
         .bp-bundle-header {
             margin: 8px 0;
             padding: 4px 8px;
@@ -217,7 +222,6 @@
             font-weight: bold;
             color: #856404;
         }
-
         #bp-po-tab-inner {
             margin: 15px 0;
             padding: 12px 15px;
@@ -263,9 +267,7 @@
             vertical-align: top;
         }
         #bp-po-table tr:hover { background: #f5f5f5; }
-        .bp-po-line {
-            white-space: nowrap;
-        }
+        .bp-po-line { white-space: nowrap; }
         .bp-po-line a {
             color: #2c5aa0;
             font-weight: 600;
@@ -294,20 +296,22 @@
             color: #b00020;
             margin-top: 4px;
         }
+        .bp-po-retry {
+            margin-left: 8px;
+            font-size: 11px;
+            color: #2c5aa0;
+            cursor: pointer;
+            text-decoration: underline;
+        }
     `;
     document.head.appendChild(style);
 
-    // ---------- helpers ----------
+    // ─────────────────────────────────────────────────────────────────────────
+    // HELPERS
+    // ─────────────────────────────────────────────────────────────────────────
     function getCurrentProductId() {
         const match = window.location.href.match(/pID=(\d+)/);
         return match ? match[1] : null;
-    }
-
-    function getCurrentSkuFromHeader() {
-        const span = document.getElementById('bp-sku-display');
-        if (!span) return null;
-        const m = span.textContent.match(/SKU:\s*(.+)$/i);
-        return m ? m[1].trim() : null;
     }
 
     function addSkuToTitle() {
@@ -327,7 +331,9 @@
         h1.appendChild(skuSpan);
     }
 
-    // ---------- inventory load ----------
+    // ─────────────────────────────────────────────────────────────────────────
+    // INVENTORY LOAD
+    // ─────────────────────────────────────────────────────────────────────────
     function fetchInventoryData() {
         return new Promise((resolve) => {
             GM_xmlhttpRequest({
@@ -357,7 +363,6 @@
                             }
 
                             const product = productDataCache[productId];
-
                             const wh = row['Products Inventory Summary - Product → Warehouse Name'];
                             const onhand = parseInt(row['Products Inventory Summary - Product → Onhand']) || 0;
                             if (wh) {
@@ -421,18 +426,11 @@
             product.bundleComponents.forEach(comp => {
                 const compData = productDataCache[comp.productId];
                 if (!compData) return;
-
                 const qty = comp.quantity || 1;
                 const stockAtWh = compData.warehouseStock[wh] || 0;
                 const possibleHere = Math.floor(stockAtWh / qty);
                 if (possibleHere < whMin) whMin = possibleHere;
-
-                details.push({
-                    sku: compData.sku,
-                    stock: stockAtWh,
-                    quantity: qty,
-                    possible: possibleHere
-                });
+                details.push({ sku: compData.sku, stock: stockAtWh, quantity: qty, possible: possibleHere });
             });
 
             if (whMin === Infinity) whMin = 0;
@@ -441,24 +439,19 @@
         });
 
         const totalBundles = Object.values(perWarehouseBundles).reduce((sum, v) => sum + v, 0);
-
-        return {
-            perWarehouseBundles,
-            perWarehouseDetails,
-            maxBundles: totalBundles
-        };
+        return { perWarehouseBundles, perWarehouseDetails, maxBundles: totalBundles };
     }
 
-    // ---------- BUNDLE TAB ----------
+    // ─────────────────────────────────────────────────────────────────────────
+    // BUNDLE TAB
+    // ─────────────────────────────────────────────────────────────────────────
     function updateBundleTable() {
         if (!inventoryDataLoaded) return;
-
         const bundleTab = document.querySelector('#undefinednav8');
         if (!bundleTab || !bundleTab.closest('li').classList.contains('tabberactive')) return;
 
         const visibleTab = document.querySelector('.tabbertab:not(.tabbertabhide)');
         if (!visibleTab) return;
-
         const rightBlock = visibleTab.querySelector('table');
         if (!rightBlock) return;
 
@@ -470,7 +463,6 @@
         document.querySelectorAll('.tabbertab:not(.tabbertabhide) input[type="text"]').forEach(input => {
             const productId = input.value.trim();
             if (!/^\d+$/.test(productId)) return;
-
             const cell = input.closest('td');
             if (!cell) return;
             const row = cell.closest('tr');
@@ -480,9 +472,7 @@
             while (currentCell && !currentCell.hasAttribute('data-bp-sku')) {
                 if (currentCell.nodeType === 1 && currentCell.tagName === 'TD') {
                     const text = currentCell.textContent.trim();
-                    if (text === '0' || text === '-' || text === '') {
-                        currentCell.style.display = 'none';
-                    }
+                    if (text === '0' || text === '-' || text === '') currentCell.style.display = 'none';
                 }
                 currentCell = currentCell.nextSibling;
             }
@@ -490,19 +480,16 @@
             const product = productDataCache[productId];
             if (!product || !product.sku) return;
 
-            let skuCell = row.querySelector('td[data-bp-sku="' + productId + '"]');
+            let skuCell = row.querySelector(`td[data-bp-sku="${productId}"]`);
             if (!skuCell) {
                 skuCell = document.createElement('td');
                 skuCell.setAttribute('data-bp-sku', productId);
-                skuCell.style.padding = '2px 4px 2px 6px';
-                skuCell.style.backgroundColor = '#f9f9f9';
-                skuCell.style.fontFamily = 'monospace';
-                skuCell.style.borderLeft = '2px solid #4CAF50';
-                skuCell.style.whiteSpace = 'nowrap';
-                skuCell.style.maxWidth = '130px';
-                skuCell.style.overflow = 'hidden';
-                skuCell.style.textOverflow = 'ellipsis';
-
+                Object.assign(skuCell.style, {
+                    padding: '2px 4px 2px 6px', backgroundColor: '#f9f9f9',
+                    fontFamily: 'monospace', borderLeft: '2px solid #4CAF50',
+                    whiteSpace: 'nowrap', maxWidth: '130px',
+                    overflow: 'hidden', textOverflow: 'ellipsis'
+                });
                 if (cell.nextSibling) row.insertBefore(skuCell, cell.nextSibling);
                 else row.appendChild(skuCell);
             }
@@ -515,29 +502,25 @@
             skuCell.innerHTML = '';
             skuCell.appendChild(skuLink);
 
-            let stockCell = row.querySelector('td[data-bp-stock="' + productId + '"]');
+            let stockCell = row.querySelector(`td[data-bp-stock="${productId}"]`);
             if (!stockCell) {
                 stockCell = document.createElement('td');
                 stockCell.setAttribute('data-bp-stock', productId);
-                stockCell.style.textAlign = 'center';
-                stockCell.style.fontWeight = 'bold';
-                stockCell.style.fontSize = '12px';
-                stockCell.style.padding = '2px 4px';
-                stockCell.style.minWidth = '40px';
-                stockCell.style.backgroundColor = '#f9f9f9';
+                Object.assign(stockCell.style, {
+                    textAlign: 'center', fontWeight: 'bold', fontSize: '12px',
+                    padding: '2px 4px', minWidth: '40px', backgroundColor: '#f9f9f9'
+                });
                 row.appendChild(stockCell);
             }
 
-            let dimCell = row.querySelector('td[data-bp-dims="' + productId + '"]');
+            let dimCell = row.querySelector(`td[data-bp-dims="${productId}"]`);
             if (!dimCell) {
                 dimCell = document.createElement('td');
                 dimCell.setAttribute('data-bp-dims', productId);
-                dimCell.style.fontSize = '10px';
-                dimCell.style.padding = '2px 4px';
-                dimCell.style.lineHeight = '1.3';
-                dimCell.style.whiteSpace = 'nowrap';
-                dimCell.style.color = '#555';
-                dimCell.style.backgroundColor = '#f9f9f9';
+                Object.assign(dimCell.style, {
+                    fontSize: '10px', padding: '2px 4px', lineHeight: '1.3',
+                    whiteSpace: 'nowrap', color: '#555', backgroundColor: '#f9f9f9'
+                });
                 row.appendChild(dimCell);
             }
 
@@ -557,16 +540,15 @@
             noticeCell.colSpan = 3;
             noticeCell.textContent = '📊 Data from Metabase - may be up to 1 hour old';
             noticeRow.appendChild(noticeCell);
-            tbody.appendChild(noticeRow);
-        } else {
-            tbody.appendChild(noticeRow);
         }
+        tbody.appendChild(noticeRow);
     }
 
-    // ---------- STOCK / INVENTORY TAB ----------
+    // ─────────────────────────────────────────────────────────────────────────
+    // STOCK / INVENTORY TAB
+    // ─────────────────────────────────────────────────────────────────────────
     function updateStockInventoryTab() {
         if (!inventoryDataLoaded) return;
-
         const stockTab = document.querySelector('#undefinednav2');
         if (!stockTab || !stockTab.closest('li').classList.contains('tabberactive')) return;
 
@@ -588,25 +570,18 @@
         breakdownDiv.id = 'bp-warehouse-breakdown';
 
         let html = '<h3>📦 Warehouse Stock Breakdown';
-        if (isBundle) {
-            html += ' <span class="bp-bundle-notice">⚙️ BUNDLE SKU</span>';
-        }
+        if (isBundle) html += ' <span class="bp-bundle-notice">⚙️ BUNDLE SKU</span>';
         html += '</h3>';
-
         html += '<div class="bp-inventory-notice">📊 Data from Metabase - may be up to 1 hour old</div>';
-
         html += '<div class="bp-bundle-header">';
-        if (isBundle) {
-            html += 'Bundle SKU — bundles available per warehouse, limited by component stock.';
-        } else {
-            html += 'Data from Metabase — stock on hand per warehouse.';
-        }
+        html += isBundle
+            ? 'Bundle SKU — bundles available per warehouse, limited by component stock.'
+            : 'Data from Metabase — stock on hand per warehouse.';
         html += '</div>';
 
-        html += '<table id="bp-warehouse-table">';
-        html += '<thead><tr><th>Warehouse</th><th>' +
-            (isBundle ? 'Bundles Available' : 'On Hand') +
-            '</th></tr></thead><tbody>';
+        html += '<table id="bp-warehouse-table"><thead><tr><th>Warehouse</th><th>';
+        html += isBundle ? 'Bundles Available' : 'On Hand';
+        html += '</th></tr></thead><tbody>';
 
         let total = 0;
 
@@ -617,8 +592,7 @@
             } else {
                 entries.forEach(([warehouse, bundles]) => {
                     total += bundles;
-                    const cls = bundles > 0 ? 'positive' : 'zero';
-                    html += `<tr><td>${warehouse}</td><td class="stock ${cls}">${bundles}</td></tr>`;
+                    html += `<tr><td>${warehouse}</td><td class="stock ${bundles > 0 ? 'positive' : 'zero'}">${bundles}</td></tr>`;
                 });
             }
         } else {
@@ -628,125 +602,198 @@
             } else {
                 warehouses.forEach(([warehouse, stock]) => {
                     total += stock;
-                    const cls = stock > 0 ? 'positive' : 'zero';
-                    html += `<tr><td>${warehouse}</td><td class="stock ${cls}">${stock}</td></tr>`;
+                    html += `<tr><td>${warehouse}</td><td class="stock ${stock > 0 ? 'positive' : 'zero'}">${stock}</td></tr>`;
                 });
             }
         }
 
         html += '</tbody>';
-
         if (isBundle && bundleData) {
             html += `<tfoot><tr><td>Total Bundles Across Warehouses</td><td class="stock positive">${bundleData.maxBundles}</td></tr></tfoot>`;
         } else {
             html += `<tfoot><tr><td>Total</td><td class="stock positive">${total}</td></tr></tfoot>`;
         }
-
         html += '</table>';
 
         breakdownDiv.innerHTML = html;
         visibleTab.appendChild(breakdownDiv);
     }
 
-    // ---------- PO DATA LOAD ----------
-    function fetchPoDataIfNeeded(callback) {
-        if (poDataLoaded) {
-            callback();
+    // ─────────────────────────────────────────────────────────────────────────
+    // PO DATA LOAD
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Builds the Metabase query URL, optionally appending a product_id parameter
+    // for server-side filtering (requires the {{product_id}} template tag in the SQL).
+    function buildPoQueryUrl(productId) {
+        const base = `${METABASE_URL}/api/public/card/${PO_QUESTION_UUID}/query/json`;
+        if (PO_PRODUCT_ID_TEMPLATE_TAG && productId) {
+            const params = JSON.stringify([{
+                type: 'number/=',
+                value: [String(productId)],
+                target: ['variable', ['template-tag', PO_PRODUCT_ID_TEMPLATE_TAG]]
+            }]);
+            return `${base}?parameters=${encodeURIComponent(params)}`;
+        }
+        return base;
+    }
+
+    // ── Column names now match the shortened Metabase SQL aliases ──────────────
+    // Old → New:
+    //   'Bp Order Item - Orderid → Productid'  → 'productid'
+    //   'Bp Order Item - Orderid → Productsku' → 'productsku'
+    //   'Bp Order Item - Orderid → Quantity'   → 'quantity'
+    //   'Statusid'                             → 'statusid'
+    //   'Warehouseid'                          → 'warehouseid'
+    //   'Orderid'                              → 'orderid'
+    //   'Delivery Date'                        → 'delivery_date'
+    function parseAndStorePoRows(rows) {
+        rows.forEach(row => {
+            const productId = row['productid'] != null
+                ? String(row['productid']).replace(/,/g, '').trim()
+                : '';
+            const statusId = row['statusid'] != null ? String(row['statusid']) : null;
+
+            // SQL already filters by status, but guard here in case of full-dataset fallback
+            if (!statusId || !ALLOWED_PO_STATUS_IDS.has(statusId)) return;
+
+            const entry = {
+                orderId:     row['orderid']      != null ? String(row['orderid'])               : '',
+                warehouseId: row['warehouseid']  != null ? String(row['warehouseid'])            : '',
+                delivery:    row['delivery_date'] ?? null,
+                sku:         row['productsku']   != null ? String(row['productsku']).trim()      : '',
+                qty:         row['quantity']     != null ? Number(row['quantity'])               : 0,
+                statusId
+            };
+
+            if (productId) {
+                if (!poRowsByProductId[productId]) poRowsByProductId[productId] = [];
+                poRowsByProductId[productId].push(entry);
+            }
+        });
+    }
+
+    function fetchPoDataIfNeeded(productId, callback) {
+        poDataError = null;
+
+        // ── Filtered mode (template tag configured) ────────────────────────────
+        if (PO_PRODUCT_ID_TEMPLATE_TAG) {
+            if (!productId) { callback(); return; }
+
+            if (poLoadedProductIds.has(productId)) { callback(); return; }
+
+            if (poLoadingProductIds.has(productId)) {
+                const check = () => poLoadedProductIds.has(productId) ? callback() : setTimeout(check, 200);
+                check();
+                return;
+            }
+
+            poLoadingProductIds.add(productId);
+
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: buildPoQueryUrl(productId),
+                timeout: 15000,
+                onload(response) {
+                    try {
+                        const raw  = JSON.parse(response.responseText);
+                        const rows = Array.isArray(raw)       ? raw
+                                   : Array.isArray(raw.data)  ? raw.data
+                                   : Array.isArray(raw.rows)  ? raw.rows
+                                   : null;
+                        if (!rows) {
+                            console.error('Unexpected Metabase PO JSON shape', raw);
+                            poDataError = 'Unexpected JSON format from Metabase PO question.';
+                        } else {
+                            parseAndStorePoRows(rows);
+                            // Ensure key exists even when no rows matched (prevents re-fetch)
+                            if (!poRowsByProductId[productId]) poRowsByProductId[productId] = [];
+                        }
+                    } catch (err) {
+                        console.error('TR PO tab parse error', err);
+                        poDataError = 'Failed to read PO data from Metabase (parse error).';
+                    } finally {
+                        poLoadedProductIds.add(productId);
+                        poLoadingProductIds.delete(productId);
+                        callback();
+                    }
+                },
+                onerror(err) {
+                    console.error('TR PO tab request error', err);
+                    poDataError = 'Error calling Metabase PO endpoint.';
+                    poLoadedProductIds.add(productId);
+                    poLoadingProductIds.delete(productId);
+                    callback();
+                },
+                ontimeout() {
+                    console.error('TR PO tab request timeout');
+                    poDataError = 'Timed out while loading PO data from Metabase.';
+                    poLoadedProductIds.add(productId);
+                    poLoadingProductIds.delete(productId);
+                    callback();
+                }
+            });
             return;
         }
-        if (poDataLoading) {
-            const check = () => {
-                if (poDataLoaded) callback();
-                else setTimeout(check, 200);
-            };
+
+        // ── Full-dataset mode (no template tag) ────────────────────────────────
+        if (poFullDataLoaded) { callback(); return; }
+
+        if (poFullDataLoading) {
+            const check = () => poFullDataLoaded ? callback() : setTimeout(check, 200);
             check();
             return;
         }
 
-        poDataLoading = true;
-        poDataError = null;
+        poFullDataLoading = true;
 
         GM_xmlhttpRequest({
             method: 'GET',
-            url: `${METABASE_URL}/api/public/card/${PO_QUESTION_UUID}/query/json`,
+            url: buildPoQueryUrl(null),
             timeout: 15000,
-            onload: function(response) {
+            onload(response) {
                 try {
-                    const raw = JSON.parse(response.responseText);
-                    const rows = Array.isArray(raw) ? raw
+                    const raw  = JSON.parse(response.responseText);
+                    const rows = Array.isArray(raw)      ? raw
                                : Array.isArray(raw.data) ? raw.data
                                : Array.isArray(raw.rows) ? raw.rows
                                : null;
-
                     if (!rows) {
                         console.error('Unexpected Metabase PO JSON shape', raw);
                         poDataError = 'Unexpected JSON format from Metabase PO question.';
                     } else {
-                        rows.forEach(row => {
-                            // Exact keys from Metabase JSON
-                            const productIdRaw = row['Bp Order Item - Orderid \u2192 Productid'];
-                            const skuRaw       = row['Bp Order Item - Orderid \u2192 Productsku'];
-                            const qtyRaw       = row['Bp Order Item - Orderid \u2192 Quantity'];
-                            const statusRaw    = row['Statusid'];
-                            const whRaw        = row['Warehouseid'];
-                            const orderIdRaw   = row['Orderid'];
-                            const deliveryRaw  = row['Delivery Date'];
-
-                            const productId = productIdRaw != null
-                                ? String(productIdRaw).replace(/,/g, '').trim()
-                                : '';
-                            const sku      = skuRaw != null ? String(skuRaw).trim() : '';
-                            const statusId = statusRaw != null ? String(statusRaw) : null;
-
-                            if (!statusId || !ALLOWED_PO_STATUS_IDS.has(statusId)) return;
-
-                            const baseObj = {
-                                orderId:  orderIdRaw != null ? String(orderIdRaw) : '',
-                                warehouseId: whRaw != null ? String(whRaw) : '',
-                                delivery: deliveryRaw,
-                                sku: sku,
-                                qty: qtyRaw != null ? Number(qtyRaw) : 0,
-                                statusId: statusId
-                            };
-
-                            if (productId) {
-                                if (!poRowsByProductId[productId]) poRowsByProductId[productId] = [];
-                                poRowsByProductId[productId].push(baseObj);
-                            }
-
-                            if (sku) {
-                                if (!poRowsBySku[sku]) poRowsBySku[sku] = [];
-                                poRowsBySku[sku].push(baseObj);
-                            }
-                        });
+                        parseAndStorePoRows(rows);
                     }
                 } catch (err) {
-                    console.error('TR PO tab Metabase parse/processing error', err, response.responseText && response.responseText.slice(0,200));
+                    console.error('TR PO tab parse/processing error', err,
+                        response.responseText && response.responseText.slice(0, 200));
                     poDataError = 'Failed to read PO data from Metabase (parse error).';
                 } finally {
-                    poDataLoaded = true;
-                    poDataLoading = false;
+                    poFullDataLoaded  = true;
+                    poFullDataLoading = false;
                     callback();
                 }
             },
-            onerror: function(err) {
-                console.error('TR PO tab Metabase request error', err);
+            onerror(err) {
+                console.error('TR PO tab request error', err);
                 poDataError = 'Error calling Metabase PO endpoint.';
-                poDataLoaded = true;
-                poDataLoading = false;
+                poFullDataLoaded  = true;
+                poFullDataLoading = false;
                 callback();
             },
-            ontimeout: function() {
-                console.error('TR PO tab Metabase request timeout');
+            ontimeout() {
+                console.error('TR PO tab request timeout');
                 poDataError = 'Timed out while loading PO data from Metabase.';
-                poDataLoaded = true;
-                poDataLoading = false;
+                poFullDataLoaded  = true;
+                poFullDataLoading = false;
                 callback();
             }
         });
     }
 
-    // ---------- TR PO TAB UI ----------
+    // ─────────────────────────────────────────────────────────────────────────
+    // TR PO TAB UI
+    // ─────────────────────────────────────────────────────────────────────────
     let poTabPanel = null;
     let poTabLink  = null;
 
@@ -796,33 +843,27 @@
         ensurePoTabExists();
         if (!poTabPanel || !poTabLink) return;
 
-        const allTabs = document.querySelectorAll('.tabbertab');
-        allTabs.forEach(t => t.classList.add('tabbertabhide'));
+        document.querySelectorAll('.tabbertab').forEach(t => t.classList.add('tabbertabhide'));
         poTabPanel.classList.remove('tabbertabhide');
 
         const navList = poTabLink.closest('ul');
         if (navList) {
             navList.querySelectorAll('li').forEach(li => li.classList.remove('tabberactive'));
-            const li = poTabLink.closest('li');
-            if (li) li.classList.add('tabberactive');
+            poTabLink.closest('li').classList.add('tabberactive');
         }
 
         const productId = getCurrentProductId();
-        const sku       = getCurrentSkuFromHeader();
-
-        if (!productId && !sku) {
-            poTabPanel.innerHTML = '<div id="bp-po-tab-inner"><h3>TR Purchase Orders</h3><div>No Product ID or SKU detected on this page.</div></div>';
+        if (!productId) {
+            poTabPanel.innerHTML = '<div id="bp-po-tab-inner"><h3>TR Purchase Orders</h3><div>No Product ID detected on this page.</div></div>';
             return;
         }
 
-        poTabPanel.innerHTML = '<div id="bp-po-tab-inner"><h3>TR Purchase Orders</h3><div class="bp-po-notice">Loading purchase orders from Metabase…</div></div>';
+        poTabPanel.innerHTML = '<div id="bp-po-tab-inner"><h3>TR Purchase Orders</h3><div class="bp-po-notice">⏳ Loading purchase orders from Metabase…</div></div>';
 
-        fetchPoDataIfNeeded(() => {
-            renderPoTab(productId, sku);
-        });
+        fetchPoDataIfNeeded(productId, () => renderPoTab(productId));
     }
 
-    function renderPoTab(productId, sku) {
+    function renderPoTab(productId) {
         ensurePoTabExists();
         if (!poTabPanel) return;
 
@@ -837,18 +878,26 @@
         html += `<div class="bp-po-notice">📊 Data from Metabase - may be up to 1 hour old. Showing only POs with statuses: ${statusList}.</div>`;
 
         if (poDataError) {
-            html += `<div id="bp-po-error">${poDataError}</div>`;
+            html += `<div id="bp-po-error">${poDataError} <span class="bp-po-retry" id="bp-po-retry-btn">Retry</span></div>`;
             inner.innerHTML = html;
             poTabPanel.innerHTML = '';
             poTabPanel.appendChild(inner);
+
+            inner.querySelector('#bp-po-retry-btn').addEventListener('click', () => {
+                if (PO_PRODUCT_ID_TEMPLATE_TAG) {
+                    poLoadedProductIds.delete(productId);
+                    poLoadingProductIds.delete(productId);
+                } else {
+                    poFullDataLoaded  = false;
+                    poFullDataLoading = false;
+                    poRowsByProductId = {};
+                }
+                openPoTab();
+            });
             return;
         }
 
-        // use ONLY productId to avoid duplicates
-        let rows = [];
-        if (productId && poRowsByProductId[productId]) {
-            rows = poRowsByProductId[productId];
-        }
+        const rows = poRowsByProductId[productId] || [];
 
         if (!rows.length) {
             html += '<div id="bp-po-empty">No matching purchase orders found for this SKU in the allowed statuses.</div>';
@@ -858,72 +907,55 @@
             return;
         }
 
+        // Group by warehouse
         const byWh = {};
         rows.forEach(r => {
-            const rawId = r.warehouseId != null ? String(r.warehouseId) : '';
-            const whName = WAREHOUSE_ID_MAP[rawId] || (rawId ? `Warehouse ${rawId}` : 'Unknown warehouse');
+            const whName = WAREHOUSE_ID_MAP[r.warehouseId] || (r.warehouseId ? `Warehouse ${r.warehouseId}` : 'Unknown warehouse');
             if (!byWh[whName]) byWh[whName] = [];
             byWh[whName].push(r);
         });
 
-        const fmtDate = (val) => {
+        const fmtDate = val => {
             if (!val) return '';
             const d = new Date(val);
-            if (isNaN(d.getTime())) return String(val);
-            return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+            return isNaN(d.getTime()) ? String(val) : d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
         };
 
-        const buildPoUrl = (orderId) => {
-            if (!orderId) return null;
-            return PO_ORDER_URL_TEMPLATE.replace('{{ORDERID}}', encodeURIComponent(orderId));
-        };
-
-        const buildStatusChip = (statusId) => {
+        const buildStatusChip = statusId => {
             const label = STATUS_NAME_BY_ID[statusId] || statusId;
             const color = STATUS_COLOR_BY_ID[statusId] || '#EEEEEE';
             return `<span class="bp-po-status-chip" style="background:${color};">${label}</span>`;
         };
 
-        html += '<table id="bp-po-table">';
-        html += '<thead><tr><th>Warehouse</th><th>Open Purchase Orders</th></tr></thead><tbody>';
+        html += '<table id="bp-po-table"><thead><tr><th>Warehouse</th><th>Open Purchase Orders</th></tr></thead><tbody>';
 
-        const whEntries = Object.entries(byWh).sort((a, b) => a[0].localeCompare(b[0]));
+        Object.entries(byWh).sort((a, b) => a[0].localeCompare(b[0])).forEach(([warehouse, list]) => {
+            const sorted = [...list].sort((a, b) => (Date.parse(a.delivery) || 0) - (Date.parse(b.delivery) || 0));
 
-        whEntries.forEach(([warehouse, list]) => {
-            const sorted = [...list].sort((a, b) => {
-                const da = Date.parse(a.delivery) || 0;
-                const db = Date.parse(b.delivery) || 0;
-                return da - db;
-            });
-
-            let lines = '';
-            sorted.forEach(o => {
-                const qty = o.qty != null ? Number(o.qty) : 0;
-                const delivery = fmtDate(o.delivery);
-                const orderId = o.orderId ? String(o.orderId) : '';
-                const url = buildPoUrl(orderId);
-                const idLabel = orderId ? `PO ${orderId}` : 'PO';
-
+            const lines = sorted.map(o => {
+                const orderId = o.orderId || '';
+                const url     = orderId
+                    ? PO_ORDER_URL_TEMPLATE.replace('{{ORDERID}}', encodeURIComponent(orderId))
+                    : null;
+                const idLabel  = orderId ? `PO ${orderId}` : 'PO';
                 const linkHtml = url
                     ? `<a href="${url}" target="_blank" title="Open ${idLabel}">${idLabel}</a>`
                     : `<span>${idLabel}</span>`;
-
-                const statusChip = buildStatusChip(o.statusId);
-
-                lines += `<div class="bp-po-line">${linkHtml} — ${qty} due ${delivery} ${statusChip}</div>`;
-            });
+                return `<div class="bp-po-line">${linkHtml} — ${Number(o.qty)} due ${fmtDate(o.delivery)} ${buildStatusChip(o.statusId)}</div>`;
+            }).join('');
 
             html += `<tr><td>${warehouse}</td><td>${lines}</td></tr>`;
         });
 
         html += '</tbody></table>';
-
         inner.innerHTML = html;
         poTabPanel.innerHTML = '';
         poTabPanel.appendChild(inner);
     }
 
-    // ---------- events & init ----------
+    // ─────────────────────────────────────────────────────────────────────────
+    // EVENTS & INIT
+    // ─────────────────────────────────────────────────────────────────────────
     document.body.addEventListener('click', function(e) {
         if (e.target.id === 'undefinednav8' || e.target.closest('#undefinednav8')) {
             setTimeout(updateBundleTable, 300);
@@ -932,14 +964,16 @@
             setTimeout(updateStockInventoryTab, 300);
         }
 
-        const a = e.target.closest('a');
-        if (a && poTabPanel && poTabLink) {
-            const navList = poTabLink.closest('ul');
-            if (navList && navList.contains(a) && a.id !== 'trakpo-nav') {
-                poTabPanel.classList.add('tabbertabhide');
-                const li = poTabLink.closest('li');
-                if (li) li.classList.remove('tabberactive');
-                document.querySelectorAll('.bp-po-notice').forEach(el => el.remove());
+        // Hide PO tab panel when any other nav tab is clicked
+        if (poTabPanel && poTabLink) {
+            const clickedLi = e.target.closest('li');
+            const poLi      = poTabLink.closest('li');
+            if (clickedLi && poLi && clickedLi !== poLi) {
+                const navList = poTabLink.closest('ul');
+                if (navList && navList.contains(clickedLi)) {
+                    poTabPanel.classList.add('tabbertabhide');
+                    poLi.classList.remove('tabberactive');
+                }
             }
         }
 
@@ -955,4 +989,3 @@
         }, 1000);
     });
 })();
-
