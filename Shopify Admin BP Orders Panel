@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Shopify Admin BP Orders Panel
 // @namespace    https://trakracer.com/
-// @version      1.3
+// @version      1.4
 // @description  Show BP order data from Metabase in Shopify admin order pages
 // @author       Erin Bond
 // @match        https://admin.shopify.com/store/*
@@ -32,7 +32,7 @@
     const PANEL_ERROR  = '#f97373';
     const PANEL_OK     = '#4ade80';
 
-    const BP_ORDER_URL = 'https://euw1.brightpearlapp.com/order-detail.php?oid=';
+    const BP_ORDER_URL = 'https://euw1.brightpearlapp.com/patt-op.php?scode=invoice&oID=';
 
     const BP_STATUS_MAP = {
         1:  { label: 'Draft / Quote',         color: PANEL_TEXT },
@@ -57,11 +57,18 @@
         42: { label: 'Chargeback',            color: PANEL_ERROR },
     };
 
+    const BP_SHIPPING_STATUS_MAP = {
+        'ASS': { label: 'All Shipped',      color: PANEL_OK },
+        'NST': { label: 'Not Shipped',      color: PANEL_ERROR },
+        'SNS': { label: 'Some Not Shipped', color: PANEL_WARN },
+        'SPS': { label: 'Part Shipped',     color: PANEL_WARN },
+    };
+
     const BP_STOCK_STATUS_MAP = {
-        'SOA': { label: 'All Allocated',    color: PANEL_OK },
-        'SOP': { label: 'Part Allocated',   color: PANEL_WARN },
-        'SON': { label: 'None Allocated',   color: PANEL_ERROR },
-        'NON': { label: 'No Stock Tracked', color: PANEL_TEXT },
+        'AAA': { label: 'All Allocated',         color: PANEL_OK },
+        'APA': { label: 'Part Allocated',         color: PANEL_WARN },
+        'ANA': { label: 'None Allocated',         color: PANEL_ERROR },
+        'ANR': { label: 'Allocation Not Required', color: PANEL_TEXT },
     };
 
     /********************************************************************
@@ -69,7 +76,7 @@
      ********************************************************************/
 
     const orderCache = {};
-    const CACHE_TTL_MS = 60 * 60 * 1000;
+    const CACHE_TTL_MS = 0;
 
     /********************************************************************
      * UTILITIES
@@ -199,19 +206,14 @@
 
     /********************************************************************
      * DOM FINDER
-     * Shopify order page uses web components with shadow roots so normal
-     * querySelectorAll can't see inside headings. Instead we find the
-     * right column by looking for s-internal-heading wrappers or by
-     * finding the section.OrderDetailsLayout element directly.
      ********************************************************************/
 
     function findOrderRightColumn() {
         const main = document.querySelector('main') || document.body;
 
-        // Strategy 1: Shopify uses a layout section we can target directly
+        // Strategy 1: Shopify order layout section
         const layout = main.querySelector('[class*="OrderDetailsLayout"], [class*="orderDetailsLayout"]');
         if (layout) {
-            // The layout has two children — left and right columns
             const children = Array.from(layout.children);
             if (children.length >= 2) {
                 log('Found right column via OrderDetailsLayout');
@@ -219,17 +221,16 @@
             }
         }
 
-        // Strategy 2: s-internal-heading web component wrappers are queryable
+        // Strategy 2: s-internal-heading web component wrappers
         const headingWrappers = Array.from(main.querySelectorAll('s-internal-heading'));
         for (const text of ['Notes', 'Customer', 'Conversion summary']) {
             const wrapper = headingWrappers.find(el => el.textContent.trim() === text);
             if (wrapper) {
-                // Walk up to find a sizeable column container
                 let el = wrapper;
                 for (let i = 0; i < 10; i++) {
                     el = el.parentElement;
                     if (!el || el === main) break;
-                    if (el.children.length >= 1 && el.className && el.className.includes('Polaris')) {
+                    if (el.className && el.className.includes('Polaris')) {
                         log('Found right column via s-internal-heading:', text);
                         return el.parentElement || el;
                     }
@@ -237,7 +238,7 @@
             }
         }
 
-        // Strategy 3: find the Polaris layout stack and take its last child
+        // Strategy 3: Polaris layout stack last child
         const stack = main.querySelector('[class*="Polaris-BlockStack"], [class*="Polaris-InlineGrid"]');
         if (stack && stack.children.length >= 2) {
             log('Found right column via Polaris layout stack');
@@ -291,7 +292,6 @@
             return panel;
         }
 
-        // Fallback: top of main
         const mainEl = document.querySelector('main');
         if (mainEl) {
             mainEl.insertBefore(panel, mainEl.firstChild);
@@ -334,10 +334,12 @@
                 body.appendChild(hr);
             }
 
-            const bpOrderId   = row['bp_order_id'];
-            const statusId    = Number(row['bp_status_id']);
-            const stockStatus = row['bp_stock_status'];
+            const bpOrderId      = row['bp_order_id'];
+            const statusId       = Number(row['bp_status_id']);
+            const stockStatus    = row['bp_stock_status'];
+            const shippingStatus = row['bp_shipping_status'];
 
+            // BP Order ID — clickable link
             const bpIdLine = document.createElement('div');
             if (bpOrderId) {
                 const a = document.createElement('a');
@@ -357,6 +359,15 @@
 
             const stockInfo = BP_STOCK_STATUS_MAP[stockStatus] || { label: stockStatus || '—', color: PANEL_TEXT };
             add(`<span style="font-weight:600;">Stock Status =</span> <span style="color:${stockInfo.color};">${stockInfo.label}</span>`);
+
+            const shippingLabel =
+                [27, 4].includes(statusId)  ? { label: 'Shipped',          color: PANEL_OK } :
+                statusId === 28             ? { label: 'Part Shipped',      color: PANEL_WARN } :
+                statusId === 26             ? { label: 'Sent for Fulfil',   color: PANEL_ACCENT } :
+                statusId === 25             ? { label: 'Pending Fulfil',    color: PANEL_WARN } :
+                statusId === 5             ? { label: 'Cancelled',          color: PANEL_ERROR } :
+                                             { label: 'Not Shipped',        color: PANEL_TEXT };
+            add(`<span style="font-weight:600;">Shipping Status =</span> <span style="color:${shippingLabel.color};">${shippingLabel.label}</span>`);
         });
 
         setPanelStatus('Loaded', PANEL_OK);
@@ -374,25 +385,21 @@
 
             const startUrl = location.href;
 
-            // Wait for order name h1 to appear
             try { await waitForOrderName(); }
             catch (e) { log('Order name never appeared:', e.message); return; }
 
-            // Read the order name
             let orderName = null;
             for (let i = 0; i < 20; i++) {
                 orderName = getOrderNameFromPage();
                 if (orderName) break;
-                await new Promise(r => setTimeout(r, 200));
+                await new Promise(r => setTimeout(r, 100));
             }
             if (!orderName) { log('Could not read order name'); return; }
             log('Order name:', orderName, '| Store:', storeCode);
 
-            // Kick off Metabase fetch immediately in background
             const dataPromise = fetchOrderData(storeCode, orderName);
 
-            // Wait for DOM to settle then inject
-            await waitForDomSettle(400, 5000);
+            await waitForDomSettle(200, 3000);
             if (location.href !== startUrl) { log('URL changed, bailing'); return; }
 
             const panel = injectPanel();
