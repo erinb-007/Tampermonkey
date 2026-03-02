@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Brightpearl Bundle Stock and Inventory Enhancement + TR PO Tab
 // @namespace    http://tampermonkey.net/
-// @version      11.15
+// @version      11.16
 // @description  Bundle & inventory enhancements + TR Purchase Orders tab loaded from Metabase POs only when opened, showing coloured status chips and hiding PO tab when other tabs are selected.
 // @author       Erin Bond
 // @match        https://euw1.brightpearlapp.com/*
@@ -956,12 +956,32 @@
     // ─────────────────────────────────────────────────────────────────────────
     // EVENTS & INIT
     // ─────────────────────────────────────────────────────────────────────────
+
+    // Watches the DOM and fires callback the moment `selector` exists.
+    // Falls back to a short poll if MutationObserver isn't available.
+    function waitForElement(selector, callback, timeout = 5000) {
+        const el = document.querySelector(selector);
+        if (el) { callback(el); return; }
+
+        const observer = new MutationObserver(() => {
+            const found = document.querySelector(selector);
+            if (found) {
+                observer.disconnect();
+                callback(found);
+            }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+
+        // Safety cutoff — disconnect if the element never appears
+        setTimeout(() => observer.disconnect(), timeout);
+    }
+
     document.body.addEventListener('click', function(e) {
         if (e.target.id === 'undefinednav8' || e.target.closest('#undefinednav8')) {
-            setTimeout(updateBundleTable, 300);
+            setTimeout(updateBundleTable, 150);
         }
         if (e.target.id === 'undefinednav2' || e.target.closest('#undefinednav2')) {
-            setTimeout(updateStockInventoryTab, 300);
+            setTimeout(updateStockInventoryTab, 150);
         }
 
         // Hide PO tab panel when any other nav tab is clicked
@@ -977,15 +997,22 @@
             }
         }
 
-        setTimeout(addSkuToTitle, 500);
+        // SKU in header: only update if it's not already there
+        if (!document.getElementById('bp-sku-display')) {
+            setTimeout(addSkuToTitle, 100);
+        }
     });
 
+    // Kick off inventory fetch immediately, then as soon as it's done:
+    //  - Use a MutationObserver to inject the SKU the instant the h1 appears
+    //    (no fixed wait — fires in ~0ms on a warm page, ~150ms on a cold load)
+    //  - Run the tab updates with a minimal 100ms settle delay instead of 1000ms
     fetchInventoryData().then(() => {
-        setTimeout(() => {
+        waitForElement('h1', () => {
             addSkuToTitle();
             updateBundleTable();
             updateStockInventoryTab();
             ensurePoTabExists();
-        }, 1000);
+        });
     });
 })();
