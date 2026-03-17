@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Brightpearl Bundle Stock and Inventory Enhancement + TR PO Tab
 // @namespace    http://tampermonkey.net/
-// @version      11.16
-// @description  Bundle & inventory enhancements + TR Purchase Orders tab loaded from Metabase POs only when opened, showing coloured status chips and hiding PO tab when other tabs are selected.
+// @version      11.20
+// @description  Bundle & inventory enhancements + TR Purchase Orders tab loaded from Metabase POs only when opened, showing coloured status chips and hiding PO tab when other tabs are selected. Now includes cost price breakdown per currency on the Prices tab.
 // @author       Erin Bond
 // @match        https://euw1.brightpearlapp.com/*
 // @updateURL    https://github.com/erinb-007/Tampermonkey/raw/refs/heads/main/Brightpearl%20Bundle%20Stock%20and%20Inventory%20Enhancement.user.js
@@ -22,15 +22,17 @@
     // PO QUESTION – "Tampermonkeyly PO Final"
     const PO_QUESTION_UUID = 'fcd1f170-b73a-4537-8f8b-105e126c938b';
 
+    // COST PRICE CARD — public Metabase question using bpproductprice table
+    // ⚠️  Replace the UUID below with your actual public card UUID
+    const COST_PRICE_CARD_UUID = 'ffcefd81-7e86-4189-a6ca-e6e379c90469';
+    const COST_PRICE_PRODUCT_ID_TEMPLATE_TAG = 'product_id';
+
     // ─── METABASE FILTERING ────────────────────────────────────────────────────
-    // Matches the {{product_id}} template-tag variable name in the Metabase SQL.
-    // Set to null to fall back to fetching the full dataset (slow, old behaviour).
     const PO_PRODUCT_ID_TEMPLATE_TAG = 'product_id';
     // ──────────────────────────────────────────────────────────────────────────
 
     const PO_ORDER_URL_TEMPLATE = 'https://euw1.brightpearlapp.com/patt-op.php?scode=invoice&oID={{ORDERID}}';
 
-    // Allowed PO statuses — must stay in sync with the SQL IN() list
     const ALLOWED_PO_STATUS_IDS = new Set(['6', '7', '34', '43', '46', '45']);
 
     const STATUS_NAME_BY_ID = {
@@ -90,12 +92,18 @@
     let inventoryDataLoaded = false;
 
     // PO DATA
-    let poRowsByProductId     = {};       // productId → rows[]
-    let poFullDataLoaded      = false;    // true once full-dataset fetch is complete
+    let poRowsByProductId     = {};
+    let poFullDataLoaded      = false;
     let poFullDataLoading     = false;
     let poLoadedProductIds    = new Set();
     let poLoadingProductIds   = new Set();
     let poDataError           = null;
+
+    // COST PRICE DATA
+    let cpRowsByProductId     = {};       // productId → rows[]
+    let cpLoadedProductIds    = new Set();
+    let cpLoadingProductIds   = new Set();
+    let cpDataError           = null;
 
     // ─────────────────────────────────────────────────────────────────────────
     // STYLES
@@ -302,6 +310,62 @@
             color: #2c5aa0;
             cursor: pointer;
             text-decoration: underline;
+        }
+
+        /* ── Cost Price Breakdown ───────────────────────────────────────────── */
+        #bp-cost-price-breakdown {
+            margin: 20px 0 10px 0;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            background: #f9f9f9;
+        }
+        #bp-cost-price-breakdown h3 {
+            margin: 0 0 6px 0;
+            font-size: 14px;
+            font-weight: bold;
+            color: #333;
+        }
+        #bp-cost-price-breakdown .bp-cp-notice {
+            font-size: 11px;
+            color: #666;
+            font-style: italic;
+            margin-bottom: 8px;
+        }
+        #bp-cost-price-table {
+            width: 100%;
+            max-width: 480px;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        #bp-cost-price-table th {
+            background: #e8e8e8;
+            padding: 7px 10px;
+            text-align: left;
+            font-weight: bold;
+            border-bottom: 2px solid #ccc;
+        }
+        #bp-cost-price-table td {
+            padding: 6px 10px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        #bp-cost-price-table tr:hover { background: #f0f0f0; }
+        #bp-cost-price-table td.bp-cp-currency {
+            font-weight: bold;
+            color: #2c5aa0;
+            white-space: nowrap;
+        }
+        #bp-cost-price-table td.bp-cp-price {
+            font-family: monospace;
+            font-size: 13px;
+        }
+        #bp-cost-price-table td.bp-cp-price.has-value { color: #1a1a1a; }
+        #bp-cost-price-table td.bp-cp-price.no-value  { color: #aaa; font-style: italic; }
+        #bp-cost-price-no-data {
+            font-size: 11px;
+            color: #888;
+            font-style: italic;
+            margin-top: 4px;
         }
     `;
     document.head.appendChild(style);
@@ -620,11 +684,227 @@
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // PO DATA LOAD
+    // COST PRICE TAB  (#undefinednav3 — "Prices")
     // ─────────────────────────────────────────────────────────────────────────
 
-    // Builds the Metabase query URL, optionally appending a product_id parameter
-    // for server-side filtering (requires the {{product_id}} template tag in the SQL).
+    function fetchCostPriceDataIfNeeded(productId, callback) {
+        cpDataError = null;
+        if (!productId) { callback(); return; }
+        if (cpLoadedProductIds.has(productId)) { callback(); return; }
+
+        if (cpLoadingProductIds.has(productId)) {
+            const check = () => cpLoadedProductIds.has(productId) ? callback() : setTimeout(check, 200);
+            check();
+            return;
+        }
+
+        cpLoadingProductIds.add(productId);
+
+        const params = JSON.stringify([{
+            type: 'number/=',
+            value: [String(productId)],
+            target: ['variable', ['template-tag', COST_PRICE_PRODUCT_ID_TEMPLATE_TAG]]
+        }]);
+        const url = `${METABASE_URL}/api/public/card/${COST_PRICE_CARD_UUID}/query/json?parameters=${encodeURIComponent(params)}`;
+
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url,
+            timeout: 15000,
+            onload(response) {
+                try {
+                    const raw  = JSON.parse(response.responseText);
+                    const rows = Array.isArray(raw)      ? raw
+                               : Array.isArray(raw.data) ? raw.data
+                               : Array.isArray(raw.rows) ? raw.rows
+                               : null;
+                    if (!rows) {
+                        console.error('Unexpected cost price JSON shape', raw);
+                        cpDataError = 'Unexpected JSON format from Metabase cost price card.';
+                    } else {
+                        cpRowsByProductId[productId] = rows.map(r => ({
+                            priceListId:  r['pricelistid']  != null ? String(r['pricelistid'])  : '',
+                            currencyCode: r['currencycode'] != null ? String(r['currencycode']).trim() : '',
+                            price:        r['price']        != null ? r['price']                : null,
+                            lastSync:     r['last_sync_time'] ?? null
+                        }));
+                    }
+                } catch (err) {
+                    console.error('Cost price parse error', err);
+                    cpDataError = 'Failed to parse cost price data from Metabase.';
+                } finally {
+                    cpLoadedProductIds.add(productId);
+                    cpLoadingProductIds.delete(productId);
+                    callback();
+                }
+            },
+            onerror(err) {
+                console.error('Cost price request error', err);
+                cpDataError = 'Error calling Metabase cost price endpoint.';
+                cpLoadedProductIds.add(productId);
+                cpLoadingProductIds.delete(productId);
+                callback();
+            },
+            ontimeout() {
+                cpDataError = 'Timed out loading cost price data from Metabase.';
+                cpLoadedProductIds.add(productId);
+                cpLoadingProductIds.delete(productId);
+                callback();
+            }
+        });
+    }
+
+    // Finds the right-hand sidebar on the Prices tab (contains Tax class, Net price calculator etc.)
+    // Falls back to appending inside the visible tab if not found.
+    function getCostPriceTarget() {
+        // The right panel wraps the Tax class dropdown and Net price calculator.
+        // BP renders it as a div/td that contains an element with text "Net price calculator".
+        const netCalc = Array.from(document.querySelectorAll('*')).find(el =>
+            el.childNodes.length &&
+            [...el.childNodes].some(n => n.nodeType === 3 && n.textContent.includes('Net price calculator')) &&
+            el.tagName !== 'SCRIPT'
+        );
+        if (netCalc) {
+            // Go up to a block-level container
+            let container = netCalc.closest('td, div, section');
+            if (container) return container;
+        }
+        // Fallback: visible tab
+        return document.querySelector('.tabbertab:not(.tabbertabhide)');
+    }
+
+    // Parses the price field which Metabase may return as:
+    //   - a plain number: 19.86
+    //   - a JSON string: {"1":"19.8600"}  (break qty → price map)
+    //   - a JSON object already parsed
+    function parsePriceField(val) {
+        if (val === null || val === undefined || val === '') return null;
+        // Already a number
+        if (typeof val === 'number') return val;
+        // String — try JSON parse
+        if (typeof val === 'string') {
+            const trimmed = val.trim();
+            if (trimmed.startsWith('{')) {
+                try {
+                    const obj = JSON.parse(trimmed);
+                    // Take the value for key "1" (break qty 1), or the first value
+                    const keys = Object.keys(obj);
+                    const baseKey = keys.includes('1') ? '1' : keys[0];
+                    return baseKey !== undefined ? parseFloat(obj[baseKey]) : null;
+                } catch (e) { /* fall through */ }
+            }
+            const n = parseFloat(trimmed);
+            return isNaN(n) ? null : n;
+        }
+        // Object already
+        if (typeof val === 'object') {
+            const keys = Object.keys(val);
+            const baseKey = keys.includes('1') ? '1' : keys[0];
+            return baseKey !== undefined ? parseFloat(val[baseKey]) : null;
+        }
+        return null;
+    }
+
+    function updateCostPricesTab() {
+        const pricesNavLink = document.querySelector('#undefinednav3');
+        if (!pricesNavLink || !pricesNavLink.closest('li').classList.contains('tabberactive')) return;
+
+        const existing = document.getElementById('bp-cost-price-breakdown');
+        if (existing) existing.remove();
+
+        const productId = getCurrentProductId();
+        if (!productId) return;
+
+        const target = getCostPriceTarget();
+        if (!target) return;
+
+        const breakdownDiv = document.createElement('div');
+        breakdownDiv.id = 'bp-cost-price-breakdown';
+        breakdownDiv.innerHTML = `<h3>💰 Cost Prices by Currency</h3>
+            <div class="bp-cp-notice">⏳ Loading cost prices from Metabase…</div>`;
+        target.appendChild(breakdownDiv);
+
+        fetchCostPriceDataIfNeeded(productId, () => renderCostPricesTab(productId));
+    }
+
+    function renderCostPricesTab(productId) {
+        let breakdownDiv = document.getElementById('bp-cost-price-breakdown');
+        if (!breakdownDiv) {
+            const target = getCostPriceTarget();
+            if (!target) return;
+            breakdownDiv = document.createElement('div');
+            breakdownDiv.id = 'bp-cost-price-breakdown';
+            target.appendChild(breakdownDiv);
+        }
+
+        let html = `<h3>💰 Cost Prices by Currency</h3>`;
+        html += `<div class="bp-cp-notice">📊 Data from Metabase — may be up to 1 hour old.</div>`;
+
+        if (cpDataError) {
+            html += `<div id="bp-cost-price-no-data" style="color:#b00020;">${cpDataError}
+                <span class="bp-po-retry" id="bp-cp-retry-btn">Retry</span></div>`;
+            breakdownDiv.innerHTML = html;
+            const retryBtn = breakdownDiv.querySelector('#bp-cp-retry-btn');
+            if (retryBtn) {
+                retryBtn.addEventListener('click', () => {
+                    cpLoadedProductIds.delete(productId);
+                    cpLoadingProductIds.delete(productId);
+                    cpDataError = null;
+                    updateCostPricesTab();
+                });
+            }
+            return;
+        }
+
+        const rows = cpRowsByProductId[productId] || [];
+
+        if (!rows.length) {
+            html += `<div id="bp-cost-price-no-data">No cost prices found for this product in Metabase.</div>`;
+            breakdownDiv.innerHTML = html;
+            return;
+        }
+
+        // Group by currency — pick the row with the lowest parsed base price per currency
+        const byCurrency = {};
+        rows.forEach(r => {
+            const parsed = parsePriceField(r.price);
+            if (!byCurrency[r.currencyCode] || (parsed !== null && parsed < byCurrency[r.currencyCode].parsedPrice)) {
+                byCurrency[r.currencyCode] = { ...r, parsedPrice: parsed };
+            }
+        });
+
+        // Sort: USD first, then alphabetically
+        const sortedEntries = Object.entries(byCurrency).sort(([a], [b]) => {
+            if (a === 'USD') return -1;
+            if (b === 'USD') return 1;
+            return a.localeCompare(b);
+        });
+
+        const fmtPrice = val => {
+            if (val === null || val === undefined || isNaN(val)) return '—';
+            return val.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+        };
+
+        html += `<table id="bp-cost-price-table">
+            <thead><tr><th>Currency</th><th>Cost Price</th></tr></thead>
+            <tbody>`;
+
+        sortedEntries.forEach(([currency, row]) => {
+            const hasValue   = row.parsedPrice !== null && row.parsedPrice > 0;
+            const priceClass = hasValue ? 'has-value' : 'no-value';
+            html += `<tr>
+                <td class="bp-cp-currency">${currency || '—'}</td>
+                <td class="bp-cp-price ${priceClass}">${fmtPrice(row.parsedPrice)}</td>
+            </tr>`;
+        });
+
+        html += `</tbody></table>`;
+        breakdownDiv.innerHTML = html;
+    }
+
+        // ─────────────────────────────────────────────────────────────────────────
+    // PO DATA LOAD
+    // ─────────────────────────────────────────────────────────────────────────
     function buildPoQueryUrl(productId) {
         const base = `${METABASE_URL}/api/public/card/${PO_QUESTION_UUID}/query/json`;
         if (PO_PRODUCT_ID_TEMPLATE_TAG && productId) {
@@ -638,15 +918,6 @@
         return base;
     }
 
-    // ── Column names now match the shortened Metabase SQL aliases ──────────────
-    // Old → New:
-    //   'Bp Order Item - Orderid → Productid'  → 'productid'
-    //   'Bp Order Item - Orderid → Productsku' → 'productsku'
-    //   'Bp Order Item - Orderid → Quantity'   → 'quantity'
-    //   'Statusid'                             → 'statusid'
-    //   'Warehouseid'                          → 'warehouseid'
-    //   'Orderid'                              → 'orderid'
-    //   'Delivery Date'                        → 'delivery_date'
     function parseAndStorePoRows(rows) {
         rows.forEach(row => {
             const productId = row['productid'] != null
@@ -654,7 +925,6 @@
                 : '';
             const statusId = row['statusid'] != null ? String(row['statusid']) : null;
 
-            // SQL already filters by status, but guard here in case of full-dataset fallback
             if (!statusId || !ALLOWED_PO_STATUS_IDS.has(statusId)) return;
 
             const entry = {
@@ -676,12 +946,9 @@
     function fetchPoDataIfNeeded(productId, callback) {
         poDataError = null;
 
-        // ── Filtered mode (template tag configured) ────────────────────────────
         if (PO_PRODUCT_ID_TEMPLATE_TAG) {
             if (!productId) { callback(); return; }
-
             if (poLoadedProductIds.has(productId)) { callback(); return; }
-
             if (poLoadingProductIds.has(productId)) {
                 const check = () => poLoadedProductIds.has(productId) ? callback() : setTimeout(check, 200);
                 check();
@@ -706,7 +973,6 @@
                             poDataError = 'Unexpected JSON format from Metabase PO question.';
                         } else {
                             parseAndStorePoRows(rows);
-                            // Ensure key exists even when no rows matched (prevents re-fetch)
                             if (!poRowsByProductId[productId]) poRowsByProductId[productId] = [];
                         }
                     } catch (err) {
@@ -736,9 +1002,7 @@
             return;
         }
 
-        // ── Full-dataset mode (no template tag) ────────────────────────────────
         if (poFullDataLoaded) { callback(); return; }
-
         if (poFullDataLoading) {
             const check = () => poFullDataLoaded ? callback() : setTimeout(check, 200);
             check();
@@ -907,7 +1171,6 @@
             return;
         }
 
-        // Group by warehouse
         const byWh = {};
         rows.forEach(r => {
             const whName = WAREHOUSE_ID_MAP[r.warehouseId] || (r.warehouseId ? `Warehouse ${r.warehouseId}` : 'Unknown warehouse');
@@ -956,9 +1219,6 @@
     // ─────────────────────────────────────────────────────────────────────────
     // EVENTS & INIT
     // ─────────────────────────────────────────────────────────────────────────
-
-    // Watches the DOM and fires callback the moment `selector` exists.
-    // Falls back to a short poll if MutationObserver isn't available.
     function waitForElement(selector, callback, timeout = 5000) {
         const el = document.querySelector(selector);
         if (el) { callback(el); return; }
@@ -971,8 +1231,6 @@
             }
         });
         observer.observe(document.body, { childList: true, subtree: true });
-
-        // Safety cutoff — disconnect if the element never appears
         setTimeout(() => observer.disconnect(), timeout);
     }
 
@@ -982,6 +1240,11 @@
         }
         if (e.target.id === 'undefinednav2' || e.target.closest('#undefinednav2')) {
             setTimeout(updateStockInventoryTab, 150);
+        }
+
+        // Prices tab — inject cost price breakdown
+        if (e.target.id === 'undefinednav3' || e.target.closest('#undefinednav3')) {
+            setTimeout(updateCostPricesTab, 150);
         }
 
         // Hide PO tab panel when any other nav tab is clicked
@@ -997,16 +1260,11 @@
             }
         }
 
-        // SKU in header: only update if it's not already there
         if (!document.getElementById('bp-sku-display')) {
             setTimeout(addSkuToTitle, 100);
         }
     });
 
-    // Kick off inventory fetch immediately, then as soon as it's done:
-    //  - Use a MutationObserver to inject the SKU the instant the h1 appears
-    //    (no fixed wait — fires in ~0ms on a warm page, ~150ms on a cold load)
-    //  - Run the tab updates with a minimal 100ms settle delay instead of 1000ms
     fetchInventoryData().then(() => {
         waitForElement('h1', () => {
             addSkuToTitle();
